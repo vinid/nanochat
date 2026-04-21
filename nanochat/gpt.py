@@ -10,6 +10,7 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
+- Native RBF-Attention with clean SuSiE and KV-Caching padding tricks
 """
 
 from functools import partial
@@ -33,6 +34,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    attention_type: str = "rbf-attention"  # ["rbf-attention", "original"]
+    n_registers: int = 1
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -62,6 +65,12 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+def get_unrotated_sinusoids(seq_len, dim, device, theta=10000.0):
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    return torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -70,6 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.n_registers = config.n_registers
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -79,7 +89,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, T0):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -94,13 +104,32 @@ class CausalSelfAttention(nn.Module):
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
+        # Calculate exact overlap between the current sequence slice and the registers
+        reg_len = max(0, min(self.n_registers - T0, T))
+        text_len = T - reg_len
 
+        q_list, k_list = [], []
+        if reg_len > 0:
+            q_list.append(q[:, :reg_len])
+            k_list.append(k[:, :reg_len])
+
+        # Apply RoPE masking out register tokens natively
+        cos, sin = cos_sin
+        if text_len > 0:
+            text_start = max(0, T0 + reg_len - self.n_registers)
+            c = cos[:, text_start : text_start + text_len]
+            s = sin[:, text_start : text_start + text_len]
+            
+            q_list.append(apply_rotary_emb(q[:, reg_len:], c, s))
+            k_list.append(apply_rotary_emb(k[:, reg_len:], c, s))
+
+        q = torch.cat(q_list, dim=1) if len(q_list) > 1 else q_list[0]
+        k = torch.cat(k_list, dim=1) if len(k_list) > 1 else k_list[0]
+
+        q, k = norm(q), norm(k)
+        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
+        k = k * 1.2 
+        
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
@@ -126,6 +155,141 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class CausalRBFSelfAttention(nn.Module):
+    """
+    RBF-Attention module leveraging the "RBF math padding trick" natively for FA3 support.
+    
+    IMPORTANT: Your external KV-Cache must allocate the padded `head_dim`: 
+    nearest_multiple_of_8(head_dim + 1)
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        self.n_registers = config.n_registers
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        
+        # Value residual ve_gate (ResFormer)
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+        # Pre-compute zero-allocation RBF padding lengths
+        self.pad_to_8 = (8 - ((self.head_dim + 1) % 8)) % 8
+        self.v_pad_len = 1 + self.pad_to_8
+
+        # SuSiE Positional Embeddings
+        self.pos_dim = self.head_dim
+        self.pos_weight_q = nn.Parameter(torch.full((1, 1, self.n_head, self.pos_dim // 2), 0.5))
+        self.pos_weight_k = nn.Parameter(torch.full((1, 1, self.n_kv_head, self.pos_dim // 2), 0.5))
+        
+        if self.n_registers > 0:
+            self.reg_pos_emb_q = nn.Parameter(torch.randn(1, self.n_registers, self.n_head, self.pos_dim) * 0.02)
+            self.reg_pos_emb_k = nn.Parameter(torch.randn(1, self.n_registers, self.n_kv_head, self.pos_dim) * 0.02)
+        
+        max_seq_len = getattr(config, "sequence_len", 8192) * 10
+        susie_cache = get_unrotated_sinusoids(max_seq_len, self.pos_dim, device="cpu")
+        self.register_buffer("susie_cache", susie_cache, persistent=False)
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, T0):
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None and self.ve_gate is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            v = v + gate.unsqueeze(-1) * ve
+
+        reg_len = max(0, min(self.n_registers - T0, T))
+        text_len = T - reg_len
+
+        pos_emb_q_list, pos_emb_k_list = [], []
+        weight_q = torch.cat([self.pos_weight_q, self.pos_weight_q], dim=-1).to(q.dtype)
+        weight_k = torch.cat([self.pos_weight_k, self.pos_weight_k], dim=-1).to(k.dtype)
+
+        if reg_len > 0:
+            pos_emb_q_list.append(self.reg_pos_emb_q[:, T0 : T0 + reg_len].to(q.dtype))
+            pos_emb_k_list.append(self.reg_pos_emb_k[:, T0 : T0 + reg_len].to(k.dtype))
+
+        if text_len > 0:
+            text_start = max(0, T0 + reg_len - self.n_registers)
+            seq_emb = self.susie_cache[text_start : text_start + text_len]
+            
+            # Broadcasting works natively over the n_head dimension during multiplication
+            seq_q = seq_emb.view(1, text_len, 1, self.pos_dim).to(device=q.device, dtype=q.dtype) * weight_q
+            pos_emb_q_list.append(seq_q)
+            
+            seq_k = seq_emb.view(1, text_len, 1, self.pos_dim).to(device=k.device, dtype=k.dtype) * weight_k
+            pos_emb_k_list.append(seq_k)
+
+        # PyTorch handles the broadcasting for B transparently
+        q = q + torch.cat(pos_emb_q_list, dim=1) if len(pos_emb_q_list) > 1 else q + pos_emb_q_list[0]
+        k = k + torch.cat(pos_emb_k_list, dim=1) if len(pos_emb_k_list) > 1 else k + pos_emb_k_list[0]
+
+        # Float32 cast guarantees square exponentiation won't naturally overflow BF16 limits
+        k_sq = torch.sum(k.to(torch.float32).square(), dim=-1).to(k.dtype)
+        
+        # Single C++ level F.pad allocation is dramatically faster than torch.cat
+        q_prime = F.pad(q, (0, self.v_pad_len))
+        q_prime[..., self.head_dim] = 1.0
+        
+        k_prime = F.pad(k, (0, self.v_pad_len))
+        k_prime[..., self.head_dim] = -0.5 * k_sq
+        
+        v_prime = F.pad(v, (0, self.v_pad_len))
+
+        # True distance scaling for RBF (compensates for padded head dimension in FA3)
+        scale = 2.0 / self.head_dim ** 0.5
+
+        # -------------------------------------------------------------
+        # Flash Attention
+        # -------------------------------------------------------------
+        if kv_cache is None:
+            y = flash_attn.flash_attn_func(
+                q_prime, k_prime, v_prime, 
+                causal=True, 
+                window_size=window_size,
+                scale=scale
+            )
+        else:
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q_prime, k_cache, v_cache,
+                k=k_prime, v=v_prime,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size,
+                scale=scale
+            )
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        if self.v_pad_len > 0:
+            y = y[..., :-self.v_pad_len]
+
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+# =========================================================================
+# BODY & ARCHITECTURE
+# =========================================================================
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -142,11 +306,17 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attention_type = config.attention_type
+        if config.attention_type == "original":
+            self.attn = CausalSelfAttention(config, layer_idx)
+        elif config.attention_type == "rbf-attention":
+            self.attn = CausalRBFSelfAttention(config, layer_idx)
+        else:
+            raise NotImplementedError(f"Unknown attention type: {config.attention_type}")
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, T0):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, T0)
         x = x + self.mlp(norm(x))
         return x
 
@@ -168,6 +338,7 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+            
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
@@ -302,7 +473,6 @@ class GPT(nn.Module):
             "L": (long_window, 0),
             "S": (short_window, 0),
         }
-        # Tile pattern across layers
         window_sizes = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
@@ -376,14 +546,17 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        h_scalar_and_pos_params = [p for p in all_h_params if p.ndim != 2] # Catches pos_weight and reg_pos_emb
+
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(h_scalar_and_pos_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -398,6 +571,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            
+            # Group non-2D block parameters into AdamW so Muon doesn't crash
+            dict(kind='adamw', params=h_scalar_and_pos_params, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -422,29 +598,25 @@ class GPT(nn.Module):
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos_sin = (self.cos, self.sin) if self.cos is not None else (None, None)
 
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        if self.cos is not None:
+            assert T + T0 <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T+T0} > {self.cos.size(1)}"
+
+        x = self.transformer.wte(idx).to(COMPUTE_DTYPE) 
         x = norm(x)
 
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            if T > 1: # Fixed to ignore 1-token non-cache inferences
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
-            # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
             elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
@@ -456,7 +628,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, T0)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
