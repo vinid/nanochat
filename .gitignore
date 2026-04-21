@@ -11,3 +11,10 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+
+eval_bundle*
+base_data*
+base_checkpoints*
+report
+tokenizer
