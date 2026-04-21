@@ -25,6 +25,8 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
+from nanochat.rbf_attention import CustomCausalAttention, CustomCausalSelfAttention
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -33,6 +35,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    attention_type: str = "original"  # "rbf_triton" | "standard"
+    n_registers: int = 1
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -142,11 +146,28 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attention_type = config.attention_type
+        if config.attention_type == "original":
+            self.attn = CausalSelfAttention(config, layer_idx)
+        else:
+            # self.attn = CustomCausalAttention(
+            #     num_heads=config.n_head,
+            #     emb_dims=config.n_embd,
+            #     max_seq_len=config.sequence_len,
+            #     use_rope=True,
+            #     attention_type=config.attention_type,
+            #     use_qk_norm="rbf" not in config.attention_type,
+            #     apply_xsa=False,
+            #     num_registers=1,
+            # )
+            self.attn = CustomCausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if self.attention_type == "original":
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        else:
+            x = x + self.attn(norm(x))  # [0]
         x = x + self.mlp(norm(x))
         return x
 
@@ -222,12 +243,15 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            try:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            except Exception as ex:
+                print(ex)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -245,11 +269,14 @@ class GPT(nn.Module):
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            try:
+                torch.nn.init.uniform_(ve.weight, -s, s)
+            except Exception as ex:
+                print(ex)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if hasattr(block.attn, "ve_gate") and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
@@ -375,15 +402,28 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
+        # # Separate out all parameters into groups
+        # matrix_params = list(self.transformer.h.parameters())
+        # value_embeds_params = list(self.value_embeds.parameters())
+        # embedding_params = list(self.transformer.wte.parameters())
+        # lm_head_params = list(self.lm_head.parameters())
+        # resid_params = [self.resid_lambdas]
+        # x0_params = [self.x0_lambdas]
+        # smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        h_scalar_and_pos_params = [p for p in all_h_params if p.ndim != 2] # Catches pos_weight and reg_pos_emb
+
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(h_scalar_and_pos_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -398,6 +438,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            
+            # NEW: Group non-2D block parameters into AdamW so Muon doesn't crash
+            dict(kind='adamw', params=h_scalar_and_pos_params, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):

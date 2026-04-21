@@ -12,6 +12,8 @@ import platform
 import psutil
 import torch
 
+from nanochat.common import get_base_dir
+
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
     try:
@@ -81,7 +83,7 @@ def get_system_info():
 
     # User and environment
     info['user'] = os.environ.get('USER', 'unknown')
-    info['nanochat_base_dir'] = os.environ.get('NANOCHAT_BASE_DIR', 'out')
+    info['nanochat_base_dir'] = get_base_dir()
     info['working_dir'] = os.getcwd()
 
     return info
