@@ -117,7 +117,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), scale=None):
         Output tensor of shape (B, T, H, D)
     """
     if USE_FA3:
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size, scale=scale)
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size, softmax_scale=scale)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
