@@ -13,6 +13,7 @@ Notable features:
 - Native RBF-Attention with clean SuSiE and KV-Caching padding tricks
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -35,16 +36,31 @@ class GPTConfig:
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
     attention_type: str = "rbf-attention"  # ["rbf-attention", "original"]
-    n_registers: int = 1
+    n_registers: int = 8
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
 
+    # --- Experimental Toggles ---
+    use_xsa: bool = False
+    use_smear: bool = True
+    use_x0_blend: bool = True
+    use_resid_scale: bool = True
+    use_backout: bool = True
+
+    def __post_init__(self):
+        if self.attention_type == "rbf-attention":
+            self.use_xsa = True
+            self.use_smear = True
+            self.use_x0_blend = False
+            self.use_resid_scale = True
+            self.use_backout = True
+
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
-
+    
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
@@ -157,10 +173,7 @@ class CausalSelfAttention(nn.Module):
 
 class CausalRBFSelfAttention(nn.Module):
     """
-    RBF-Attention module leveraging the "RBF math padding trick" natively for FA3 support.
-    
-    IMPORTANT: Your external KV-Cache must allocate the padded `head_dim`: 
-    nearest_multiple_of_8(head_dim + 1)
+    Geometrically pure RBF-Attention orienting on the robust simple implementation.
     """
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -170,6 +183,7 @@ class CausalRBFSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         self.n_registers = config.n_registers
+        self.use_xsa = config.use_xsa
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
@@ -194,8 +208,8 @@ class CausalRBFSelfAttention(nn.Module):
         if self.n_registers > 0:
             self.reg_pos_emb_q = nn.Parameter(torch.randn(1, self.n_registers, self.n_head, self.pos_dim) * 0.02)
             self.reg_pos_emb_k = nn.Parameter(torch.randn(1, self.n_registers, self.n_kv_head, self.pos_dim) * 0.02)
-        
-        max_seq_len = getattr(config, "sequence_len", 8192) * 10
+
+        max_seq_len = config.sequence_len * 10
         susie_cache = get_unrotated_sinusoids(max_seq_len, self.pos_dim, device="cpu")
         self.register_buffer("susie_cache", susie_cache, persistent=False)
 
@@ -222,7 +236,7 @@ class CausalRBFSelfAttention(nn.Module):
         weight_k = torch.cat([self.pos_weight_k, self.pos_weight_k], dim=-1).to(k.dtype)
 
         if reg_len > 0:
-            pos_emb_q_list.append(self.reg_pos_emb_q[:, T0 : T0 + reg_len].to(q.dtype))
+            pos_emb_q_list.append(self.reg_pos_emb_q[:, T0 : T0 + reg_len].to(k.dtype))
             pos_emb_k_list.append(self.reg_pos_emb_k[:, T0 : T0 + reg_len].to(k.dtype))
 
         if text_len > 0:
@@ -240,7 +254,8 @@ class CausalRBFSelfAttention(nn.Module):
         q = q + torch.cat(pos_emb_q_list, dim=1) if len(pos_emb_q_list) > 1 else q + pos_emb_q_list[0]
         k = k + torch.cat(pos_emb_k_list, dim=1) if len(pos_emb_k_list) > 1 else k + pos_emb_k_list[0]
 
-        # Float32 cast guarantees square exponentiation won't naturally overflow BF16 limits
+
+        # FA3 Padding Math
         k_sq = torch.sum(k.to(torch.float32).square(), dim=-1).to(k.dtype)
         
         # Single C++ level F.pad allocation is dramatically faster than torch.cat
@@ -249,32 +264,34 @@ class CausalRBFSelfAttention(nn.Module):
         
         k_prime = F.pad(k, (0, self.v_pad_len))
         k_prime[..., self.head_dim] = -0.5 * k_sq
-        
         v_prime = F.pad(v, (0, self.v_pad_len))
+        if reg_len > 0:
+            v_prime = v_prime.clone()
+            v_prime[:, :reg_len, :, :] = 0.0
 
-        # True distance scaling for RBF (compensates for padded head dimension in FA3)
-        scale = 2.0 / self.head_dim ** 0.5
+        scale = 2.0 / math.sqrt(8 * self.head_dim)
 
-        # -------------------------------------------------------------
-        # Flash Attention
-        # -------------------------------------------------------------
         if kv_cache is None:
             y = flash_attn.flash_attn_func(
                 q_prime, k_prime, v_prime, 
-                causal=True, 
-                window_size=window_size,
-                scale=scale
+                causal=True, window_size=window_size, scale=scale
             )
+            if self.use_xsa:
+                v_n = F.normalize(v_prime, dim=-1)
+                y = y - (y * v_n).sum(dim=-1, keepdim=True) * v_n
         else:
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q_prime, k_cache, v_cache,
                 k=k_prime, v=v_prime,
                 cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-                scale=scale
+                causal=True, window_size=window_size, scale=scale
             )
+
+            if self.use_xsa:
+                v_n = F.normalize(v_prime, dim=-1)
+                y = y - (y * v_n).sum(dim=-1, keepdim=True) * v_n
+
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
@@ -284,7 +301,7 @@ class CausalRBFSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
-
+    
 
 # =========================================================================
 # BODY & ARCHITECTURE
@@ -359,6 +376,10 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        
+        if config.n_registers > 0:
+            self.register_tokens = nn.Parameter(torch.zeros(1, config.n_registers, config.n_embd))
+
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -394,7 +415,8 @@ class GPT(nn.Module):
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            # torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            block.attn.c_k.weight.data = block.attn.c_q.weight.data.clone() + torch.randn_like(block.attn.c_q.weight) * 0.001
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
@@ -422,6 +444,19 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        if hasattr(self, 'register_tokens'):
+            torch.nn.init.normal_(self.register_tokens, mean=0.0, std=1.0)
+
+        if self.config.attention_type == "rbf-attention":
+           for block in self.transformer.h:
+                torch.nn.init.constant_(block.attn.pos_weight_q, 0.5)
+                torch.nn.init.constant_(block.attn.pos_weight_k, 0.5)
+                
+                if self.config.n_registers > 0:
+                    # Initialize the explicit Register Positional anchors
+                    torch.nn.init.zeros_(block.attn.reg_pos_emb_q)
+                    torch.nn.init.zeros_(block.attn.reg_pos_emb_k)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -499,6 +534,15 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        registers_numel = self.register_tokens.numel() if hasattr(self, 'register_tokens') else 0
+
+        nparams_exclude = (
+            self.transformer.wte.weight.numel() + value_embeds_numel +
+            self.resid_lambdas.numel() + self.x0_lambdas.numel() +
+            self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + registers_numel
+        )
+
+
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
@@ -530,7 +574,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        registers = self.register_tokens.numel() if hasattr(self, 'register_tokens') else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + registers
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -552,6 +597,9 @@ class GPT(nn.Module):
 
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
+        if hasattr(self, 'register_tokens'):
+            embedding_params.append(self.register_tokens)
+
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
@@ -566,15 +614,27 @@ class GPT(nn.Module):
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            
-            # Group non-2D block parameters into AdamW so Muon doesn't crash
-            dict(kind='adamw', params=h_scalar_and_pos_params, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+
+        # Split mixed parameter groups by EXACT shape so Dynamo doesn't crash
+        for shape in sorted({p.shape for p in embedding_params}):
+            param_groups.append(
+                dict(kind='adamw', params=[p for p in embedding_params if p.shape == shape], lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001)
+            )
+
+        for shape in sorted({p.shape for p in smear_params}):
+            param_groups.append(
+                dict(kind='adamw', params=[p for p in smear_params if p.shape == shape], lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+            )
+
+        for shape in sorted({p.shape for p in h_scalar_and_pos_params}):
+            param_groups.append(
+                dict(kind='adamw', params=[p for p in h_scalar_and_pos_params if p.shape == shape], lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)  # TODO: check weight_decay
+            )
+        
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -606,19 +666,33 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx).to(COMPUTE_DTYPE) 
         x = norm(x)
 
-        if kv_cache is None:
-            if T > 1: # Fixed to ignore 1-token non-cache inferences
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        else:
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+        # 1. Optional Token Smearing
+        if self.config.use_smear:
+            if kv_cache is None:
+                if T > 1: # Fixed to ignore 1-token non-cache inferences
+                    if self.config.attention_type != "rbf-attention":
+                        gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                        x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                    else:
+                        gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                        # Safe Euclidean Interpolation!
+                        smeared = (1.0 - gate) * x[:, 1:] + gate * x[:, :-1]
+                        x = torch.cat([x[:, :1], smeared], dim=1)
+            else:
+                x_pre_smear = kv_cache.prev_embedding
+                kv_cache.prev_embedding = x[:, -1:, :]
+                if T > 1:
+                    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                    x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                elif x_pre_smear is not None:
+                    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
+                    x = x + gate * x_pre_smear
+
+        prepend_regs = self.config.n_registers > 0 and (kv_cache is None or kv_cache.get_pos() == 0)
+        
+        if prepend_regs:
+            regs = self.register_tokens.expand(B, -1, -1).to(x.dtype)
+            x = torch.cat([regs, x], dim=1)
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
@@ -626,15 +700,31 @@ class GPT(nn.Module):
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            current_x = x
+            if self.config.use_resid_scale:
+                current_x = self.resid_lambdas[i] * current_x
+            if self.config.use_x0_blend:
+                current_x = current_x + self.x0_lambdas[i] * x0
+            x = current_x
+
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if ve is not None and prepend_regs:
+                ve_regs = torch.zeros(B, self.config.n_registers, ve.size(-1), dtype=ve.dtype, device=ve.device)
+                ve = torch.cat([ve_regs, ve], dim=1)
+                
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, T0)
-            if i == backout_layer:
+            
+            if self.config.use_backout and i == backout_layer:
                 x_backout = x
+                
         # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
+        if self.config.use_backout and x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
+            
         x = norm(x)
+
+        if prepend_regs:
+            x = x[:, self.config.n_registers:, :]
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]

@@ -34,6 +34,10 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
+
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -52,7 +56,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-parser.add_argument("--attention-type", type=str, default="original", choices=["original", "rbf_triton", "standard"], help="attention implementation: original (FA3/SDPA), rbf_triton (RBF kernel), standard (SDPA via CustomCausalSelfAttention)")
+parser.add_argument("--attention-type", type=str, default="original", choices=["original", "rbf-attention"], help="attention implementation: original (FA3/SDPA), rbf_triton (RBF kernel), standard (SDPA via CustomCausalSelfAttention)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
